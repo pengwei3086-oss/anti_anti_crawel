@@ -32,8 +32,10 @@ import logging
 import os
 import random
 import re
+import ssl
 import time
 import urllib.parse
+import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -135,6 +137,7 @@ PAGE_PATH_PATTERNS = [
 class FetchStrategy(Enum):
     """抓取策略"""
     HTTPX = "httpx"                    # 直接HTTP请求
+    URLLIB = "urllib"                  # 标准库HTTP请求（无第三方依赖回退）
     CRAWL4AI = "crawl4ai"              # crawl4ai JS渲染
     PLAYWRIGHT = "playwright"          # Playwright浏览器
     SELENIUM = "selenium"              # Selenium浏览器
@@ -356,14 +359,20 @@ class RequestExecutor:
 
         strategies.extend([
             FetchStrategy.HTTPX,
+            FetchStrategy.URLLIB,
             FetchStrategy.CRAWL4AI,
             FetchStrategy.PLAYWRIGHT,
             FetchStrategy.SELENIUM,
         ])
 
+        strategies = list(dict.fromkeys(strategies))
+        best_failed_result: Optional[FetchResult] = None
+
         for strategy in strategies:
             if strategy == FetchStrategy.HTTPX:
                 result = await self._fetch_with_httpx(url, custom_headers)
+            elif strategy == FetchStrategy.URLLIB:
+                result = await self._fetch_with_urllib(url, custom_headers)
             elif strategy == FetchStrategy.CRAWL4AI:
                 if not self.enable_js_fallback:
                     continue
@@ -383,6 +392,9 @@ class RequestExecutor:
                     self._save_debug_page(result)
                 return result
 
+            if "未安装" not in result.error_detail:
+                best_failed_result = result
+
             # 如果检测到安全验证，尝试绕过
             if result.security_challenge and result.security_challenge != SecurityChallenge.NONE:
                 logger.info(f"检测到安全验证: {result.security_challenge.value}，尝试绕过...")
@@ -392,7 +404,7 @@ class RequestExecutor:
                     if result.success:
                         return result
 
-        return result
+        return best_failed_result or result
 
     async def _fetch_with_httpx(self, url: str,
                                  custom_headers: Optional[Dict] = None) -> FetchResult:
@@ -501,6 +513,123 @@ class RequestExecutor:
 
         return result
 
+    async def _fetch_with_urllib(self, url: str,
+                                  custom_headers: Optional[Dict] = None) -> FetchResult:
+        """使用标准库 urllib 抓取，作为没有 httpx 时的轻量回退。"""
+        result = FetchResult(url=url, strategy=FetchStrategy.URLLIB)
+
+        headers = DEFAULT_HEADERS.copy()
+        headers.update({
+            "User-Agent": self.ua_manager.random(),
+            "Accept": (
+                "text/html,application/xhtml+xml,application/xml;q=0.9,"
+                "image/avif,image/webp,image/apng,*/*;q=0.8"
+            ),
+            "Accept-Language": "en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+        })
+        if custom_headers:
+            headers.update(custom_headers)
+
+        ssl_context = ssl.create_default_context()
+
+        for attempt in range(self.max_retries + 1):
+            try:
+                start_time = time.time()
+                request = urllib.request.Request(url, headers=headers, method="GET")
+
+                def _open():
+                    if self.proxy:
+                        opener = urllib.request.build_opener(
+                            urllib.request.ProxyHandler({
+                                "http": self.proxy,
+                                "https": self.proxy,
+                            }),
+                            urllib.request.HTTPSHandler(context=ssl_context),
+                        )
+                        return opener.open(request, timeout=self.timeout)
+                    return urllib.request.urlopen(request, timeout=self.timeout, context=ssl_context)
+
+                response = await asyncio.to_thread(_open)
+                with response:
+                    raw = response.read()
+                    charset = response.headers.get_content_charset() or "utf-8"
+                    html = raw.decode(charset, errors="replace")
+
+                    result.response_time_ms = int((time.time() - start_time) * 1000)
+                    result.status_code = getattr(response, "status", 200)
+                    result.final_url = response.geturl()
+                    result.headers_used = dict(response.headers.items())
+                    result.html = html
+
+                title = ""
+                title_match = re.search(r'<title[^>]*>(.*?)</title>', html, re.DOTALL | re.IGNORECASE)
+                if title_match:
+                    title = title_match.group(1)
+
+                detected, challenge_type, details = SecurityDetector.detect(
+                    title, html, result.final_url or url
+                )
+                if detected:
+                    result.security_challenge = challenge_type
+                    result.error_category = ErrorCategory.SECURITY_CHALLENGE
+                    result.error_detail = f"安全验证: {challenge_type.value}"
+                    return result
+
+                if result.status_code >= 400:
+                    result.error_category = ErrorCategory.INVALID_RESPONSE
+                    result.error_detail = f"HTTP {result.status_code}"
+                    if attempt < self.max_retries:
+                        await asyncio.sleep(self.retry_delay)
+                        headers["User-Agent"] = self.ua_manager.random()
+                        continue
+                    return result
+
+                if not html or len(html) < 100:
+                    result.error_category = ErrorCategory.INVALID_RESPONSE
+                    result.error_detail = f"HTML太短 ({len(html) if html else 0} chars)"
+                    if attempt < self.max_retries:
+                        await asyncio.sleep(self.retry_delay)
+                        headers["User-Agent"] = self.ua_manager.random()
+                        continue
+                    return result
+
+                result.success = True
+                result.retry_count = attempt
+                return result
+
+            except urllib.error.HTTPError as e:
+                result.status_code = e.code
+                result.final_url = e.geturl()
+                result.error_category = ErrorCategory.INVALID_RESPONSE
+                result.error_detail = f"HTTP {e.code}"
+                try:
+                    raw = e.read()
+                    result.html = raw.decode("utf-8", errors="replace")
+                except Exception:
+                    pass
+                if attempt < self.max_retries:
+                    await asyncio.sleep(self.retry_delay)
+                    headers["User-Agent"] = self.ua_manager.random()
+                continue
+            except TimeoutError:
+                result.error_category = ErrorCategory.TIMEOUT
+                result.error_detail = "urllib请求超时"
+                if attempt < self.max_retries:
+                    await asyncio.sleep(self.retry_delay * (attempt + 1))
+                    headers["User-Agent"] = self.ua_manager.random()
+                continue
+            except Exception as e:
+                result.error_category = ErrorCategory.UNKNOWN
+                result.error_detail = f"urllib错误: {e}"
+                if attempt < self.max_retries:
+                    await asyncio.sleep(self.retry_delay)
+                    headers["User-Agent"] = self.ua_manager.random()
+                continue
+
+        return result
+
     async def _fetch_with_crawl4ai(self, url: str) -> FetchResult:
         """使用 crawl4ai 抓取（支持JS渲染）"""
         result = FetchResult(url=url, strategy=FetchStrategy.CRAWL4AI)
@@ -576,6 +705,15 @@ class RequestExecutor:
                     user_agent=self.ua_manager.random(),
                     ignore_https_errors=True,
                     viewport={"width": 1920, "height": 1080},
+                    locale="en-US",
+                    timezone_id="America/New_York",
+                    java_script_enabled=True,
+                    bypass_csp=True,
+                    extra_http_headers={
+                        "Accept-Language": "en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7",
+                        "DNT": "1",
+                        "Upgrade-Insecure-Requests": "1",
+                    },
                 )
 
                 page = await context.new_page()
@@ -585,15 +723,26 @@ class RequestExecutor:
                     Object.defineProperty(navigator, 'webdriver', {
                         get: () => undefined
                     });
+                    Object.defineProperty(navigator, 'languages', {
+                        get: () => ['en-US', 'en', 'zh-CN', 'zh']
+                    });
+                    Object.defineProperty(navigator, 'plugins', {
+                        get: () => [1, 2, 3, 4, 5]
+                    });
+                    window.chrome = window.chrome || { runtime: {} };
                 """)
 
                 try:
-                    await page.goto(url, timeout=self.timeout * 1000, wait_until="networkidle")
-                    await page.wait_for_timeout(2000)
+                    response = await page.goto(url, timeout=self.timeout * 1000, wait_until="domcontentloaded")
+                    try:
+                        await page.wait_for_load_state("networkidle", timeout=10000)
+                    except Exception:
+                        pass
+                    await page.wait_for_timeout(random.randint(1500, 3500))
 
                     result.final_url = page.url
                     result.html = await page.content()
-                    result.status_code = 200
+                    result.status_code = response.status if response else 200
                     result.response_time_ms = int((time.time() - start_time) * 1000)
 
                     # 检测安全验证
@@ -629,8 +778,12 @@ class RequestExecutor:
                         else:
                             # 其他验证类型，尝试刷新
                             logger.info(f"检测到{challenge_type.value}验证，尝试刷新...")
-                            await page.goto(url, timeout=self.timeout * 1000, wait_until="networkidle")
-                            await page.wait_for_timeout(2000)
+                            await page.goto(url, timeout=self.timeout * 1000, wait_until="domcontentloaded")
+                            try:
+                                await page.wait_for_load_state("networkidle", timeout=10000)
+                            except Exception:
+                                pass
+                            await page.wait_for_timeout(random.randint(1500, 3500))
                             new_title = await page.title()
                             new_html = await page.content()
                             re_detected, _, _ = SecurityDetector.detect(
@@ -680,8 +833,15 @@ class RequestExecutor:
             chrome_options.add_argument("--disable-gpu")
             chrome_options.add_argument("--window-size=1920,1080")
             chrome_options.add_argument("--disable-blink-features=AutomationControlled")
+            chrome_options.add_argument("--lang=en-US,en")
+            chrome_options.add_argument("--disable-web-security")
+            chrome_options.add_argument("--disable-features=IsolateOrigins,site-per-process")
             chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
             chrome_options.add_experimental_option('useAutomationExtension', False)
+            chrome_options.add_experimental_option("prefs", {
+                "intl.accept_languages": "en-US,en,zh-CN,zh",
+                "profile.default_content_setting_values.notifications": 2,
+            })
             chrome_options.add_argument(f"--user-agent={self.ua_manager.random()}")
 
             start_time = time.time()
@@ -695,7 +855,12 @@ class RequestExecutor:
 
                 # 隐藏webdriver特征
                 driver.execute_script(
-                    "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+                    """
+                    Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+                    Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en', 'zh-CN', 'zh']});
+                    Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+                    window.chrome = window.chrome || { runtime: {} };
+                    """
                 )
 
                 result.final_url = driver.current_url
@@ -1135,6 +1300,7 @@ class AntiAntiCrawler:
 def main():
     """命令行入口"""
     import argparse
+    import csv
 
     parser = argparse.ArgumentParser(
         description="反反爬综合工具 - 多策略网站访问",
@@ -1161,11 +1327,20 @@ def main():
         """,
     )
 
-    parser.add_argument("url", help="目标URL")
+    parser.add_argument("url", nargs="?", help="目标URL")
+    parser.add_argument("--excel", help="从Excel读取域名列表，默认只重测error列非空的失败项")
+    parser.add_argument("--sheet", default=None, help="Excel工作表名称，默认第一个工作表")
+    parser.add_argument("--url-column", default="u", help="Excel中的URL列名")
+    parser.add_argument("--domain-column", default="域名", help="Excel中的域名列名")
+    parser.add_argument("--error-column", default="error", help="Excel中的错误列名")
+    parser.add_argument("--all-rows", action="store_true", help="读取Excel全部行，而不是只读取失败行")
+    parser.add_argument("--limit", type=int, default=0, help="批量模式最多测试多少条，0表示不限制")
+    parser.add_argument("--output", default="crawl_retry_report.csv", help="批量模式CSV结果文件")
+    parser.add_argument("--json-output", default="", help="批量模式JSON结果文件")
     parser.add_argument("--proxy", "-p", help="代理地址 (socks5://... 或 http://...)")
     parser.add_argument(
         "--strategy", "-s",
-        choices=["httpx", "crawl4ai", "playwright", "selenium"],
+        choices=["httpx", "urllib", "crawl4ai", "playwright", "selenium"],
         help="首选抓取策略",
     )
     parser.add_argument("--max-pages", "-n", type=int, default=1, help="最大翻页数")
@@ -1196,17 +1371,55 @@ def main():
     # 策略映射
     strategy_map = {
         "httpx": FetchStrategy.HTTPX,
+        "urllib": FetchStrategy.URLLIB,
         "crawl4ai": FetchStrategy.CRAWL4AI,
         "playwright": FetchStrategy.PLAYWRIGHT,
         "selenium": FetchStrategy.SELENIUM,
     }
     preferred_strategy = strategy_map.get(args.strategy)
 
+    def load_excel_targets(path: str) -> List[Dict[str, str]]:
+        try:
+            import openpyxl
+        except ImportError as exc:
+            raise RuntimeError("读取Excel需要安装 openpyxl") from exc
+
+        wb = openpyxl.load_workbook(path, data_only=True)
+        ws = wb[args.sheet] if args.sheet else wb.worksheets[0]
+        headers = [str(cell.value).strip() if cell.value is not None else "" for cell in ws[1]]
+        header_index = {name: idx for idx, name in enumerate(headers)}
+
+        missing = [name for name in [args.url_column, args.domain_column, args.error_column]
+                   if name and name not in header_index]
+        if missing:
+            raise RuntimeError(f"Excel缺少列: {', '.join(missing)}")
+
+        targets = []
+        for row in ws.iter_rows(min_row=2, values_only=True):
+            url_value = row[header_index[args.url_column]] if header_index[args.url_column] < len(row) else None
+            domain_value = row[header_index[args.domain_column]] if header_index[args.domain_column] < len(row) else ""
+            error_value = row[header_index[args.error_column]] if header_index[args.error_column] < len(row) else ""
+            if not url_value:
+                continue
+            if not args.all_rows and error_value in (None, ""):
+                continue
+            targets.append({
+                "domain": str(domain_value or ""),
+                "url": str(url_value).strip(),
+                "previous_error": str(error_value or ""),
+            })
+            if args.limit and len(targets) >= args.limit:
+                break
+
+        return targets
+
     # 打印信息
     print("=" * 60)
-    print("🛡️  反反爬综合工具")
+    print("[AntiAntiCrawler] 反反爬综合工具")
     print("=" * 60)
-    print(f"  URL:      {args.url}")
+    print(f"  URL:      {args.url or '(Excel批量模式)'}")
+    if args.excel:
+        print(f"  Excel:    {args.excel}")
     print(f"  策略:     {args.strategy or '自动'}")
     print(f"  翻页:     {args.max_pages} 页")
     print(f"  代理:     {args.proxy or '无'}")
@@ -1216,16 +1429,66 @@ def main():
 
     # 执行
     async def run():
-        if args.max_pages > 1:
+        if args.excel:
+            targets = load_excel_targets(args.excel)
+            print(f"\n待测试目标: {len(targets)} 个")
+            batch_results = []
+
+            for idx, target in enumerate(targets, start=1):
+                print(f"\n[{idx}/{len(targets)}] {target['domain']} {target['url']}")
+                result = await aac.fetch(target["url"], preferred_strategy)
+                row = {
+                    "domain": target["domain"],
+                    "url": target["url"],
+                    "previous_error": target["previous_error"],
+                    "success": result.success,
+                    "strategy": result.strategy.value if result.strategy else "",
+                    "status_code": result.status_code,
+                    "final_url": result.final_url,
+                    "html_size": len(result.html),
+                    "response_time_ms": result.response_time_ms,
+                    "security_challenge": result.security_challenge.value if result.security_challenge else "",
+                    "error_category": result.error_category.value,
+                    "error_detail": result.error_detail,
+                }
+                batch_results.append(row)
+                print(
+                    f"  {'成功' if result.success else '失败'} | "
+                    f"{row['strategy']} | HTTP {row['status_code']} | "
+                    f"{row['html_size']} chars | {row['error_detail']}"
+                )
+
+            fieldnames = [
+                "domain", "url", "previous_error", "success", "strategy",
+                "status_code", "final_url", "html_size", "response_time_ms",
+                "security_challenge", "error_category", "error_detail",
+            ]
+            with open(args.output, "w", newline="", encoding="utf-8-sig") as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(batch_results)
+            print(f"\nCSV结果已保存: {args.output}")
+
+            if args.json_output:
+                with open(args.json_output, "w", encoding="utf-8") as f:
+                    json.dump(batch_results, f, ensure_ascii=False, indent=2)
+                print(f"JSON结果已保存: {args.json_output}")
+
+            results = []
+        elif args.max_pages > 1:
+            if not args.url:
+                raise RuntimeError("单URL模式需要提供url参数")
             results = await aac.fetch_pages(args.url, args.max_pages, preferred_strategy)
         else:
+            if not args.url:
+                raise RuntimeError("请提供url，或使用 --excel 进入批量模式")
             result = await aac.fetch(args.url, preferred_strategy)
             results = [result]
 
         # 输出结果
         for i, result in enumerate(results):
-            status = "✅ 成功" if result.success else "❌ 失败"
-            print(f"\n📄 第{i+1}页结果:")
+            status = "成功" if result.success else "失败"
+            print(f"\n第{i+1}页结果:")
             print(f"  状态:     {status}")
             print(f"  策略:     {result.strategy.value if result.strategy else '无'}")
             print(f"  状态码:   {result.status_code}")
@@ -1234,15 +1497,15 @@ def main():
             print(f"  HTML大小: {len(result.html)} 字符")
 
             if result.security_challenge and result.security_challenge != SecurityChallenge.NONE:
-                print(f"  ⚠️ 安全验证: {result.security_challenge.value}")
+                print(f"  安全验证: {result.security_challenge.value}")
 
             if result.error_detail:
-                print(f"  ⚠️ 错误: {result.error_detail}")
+                print(f"  错误: {result.error_detail}")
 
         # 统计
         stats = aac.get_stats()
         print("\n" + "=" * 50)
-        print("📊 请求统计")
+        print("请求统计")
         print("=" * 50)
         print(f"  总请求数:     {stats['total_requests']}")
         print(f"  成功请求:     {stats['successful_requests']}")
